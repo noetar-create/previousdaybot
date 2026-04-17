@@ -304,37 +304,17 @@ if enableAlerts and onEntry
     action      = isLongEntry ? "long_entry" : "short_entry"
     stopPtsUsed = activeStrategy == "OVERNIGHT" ? on_stopPts : pdhl_stopPts
 
-    jsonMsg = '{"secret":"' + webhookSecret + '"'
-        + ',"strategy":"' + activeStrategy + '"'
-        + ',"action":"' + action + '"'
-        + ',"price":' + str.tostring(close, "#.##")
-        + ',"ticker":"' + syminfo.ticker + '"'
-        + ',"contracts":' + str.tostring(contracts)
-        + ',"stop_pts":' + str.tostring(stopPtsUsed, "#.#")
-        + ',"setup":"' + activeSetup + '"'
-        + ',"pd_high":' + str.tostring(pdHigh, "#.##")
-        + ',"pd_low":' + str.tostring(pdLow, "#.##")
-        + '}'
+    jsonMsg = '{"secret":"' + webhookSecret + '","strategy":"' + activeStrategy + '","action":"' + action + '","price":' + str.tostring(close, "#.##") + ',"ticker":"' + syminfo.ticker + '","contracts":' + str.tostring(contracts) + ',"stop_pts":' + str.tostring(stopPtsUsed, "#.#") + ',"setup":"' + activeSetup + '","pd_high":' + str.tostring(pdHigh, "#.##") + ',"pd_low":' + str.tostring(pdLow, "#.##") + '}'
 
     alert(jsonMsg, alert.freq_once_per_bar_close)
 
 if enableAlerts and onExit
     isLongExit  = strategy.position_size[1] > 0
     action      = isLongExit ? "long_exit" : "short_exit"
-    grossProfit = strategy.closedtrades.profit(strategy.closedtrades - 1)
-        + strategy.closedtrades.commission(strategy.closedtrades - 1)
+    grossProfit = strategy.closedtrades.profit(strategy.closedtrades - 1) + strategy.closedtrades.commission(strategy.closedtrades - 1)
     pnlPts      = grossProfit / (syminfo.pointvalue * contracts)
     pnlDollars  = strategy.closedtrades.profit(strategy.closedtrades - 1)
 
-    jsonMsg = '{"secret":"' + webhookSecret + '"'
-        + ',"strategy":"' + activeStrategy + '"'
-        + ',"action":"' + action + '"'
-        + ',"price":' + str.tostring(close, "#.##")
-        + ',"ticker":"' + syminfo.ticker + '"'
-        + ',"contracts":' + str.tostring(contracts)
-        + ',"stop_pts":0'
-        + ',"pnl_pts":' + str.tostring(pnlPts, "#.##")
-        + ',"pnl_usd":' + str.tostring(pnlDollars, "#.##")
-        + '}'
+    jsonMsg = '{"secret":"' + webhookSecret + '","strategy":"' + activeStrategy + '","action":"' + action + '","price":' + str.tostring(close, "#.##") + ',"ticker":"' + syminfo.ticker + '","contracts":' + str.tostring(contracts) + ',"stop_pts":0,"pnl_pts":' + str.tostring(pnlPts, "#.##") + ',"pnl_usd":' + str.tostring(pnlDollars, "#.##") + '}'
 
     alert(jsonMsg, alert.freq_once_per_bar_close)
