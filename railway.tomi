@@ -1,0 +1,73 @@
+//@version=6
+indicator("Step1 - Colors Only", overlay=true, max_boxes_count=500)
+
+weekOneIsOdd = input.bool(true, "Week 1 = purple/yellow (uncheck to swap)")
+
+nyTime = time("60", "America/New_York")
+nyDow  = dayofweek(nyTime)
+nyHour = hour(nyTime)
+nyDate = dayofmonth(nyTime)
+nyMon  = month(nyTime)
+
+// Debug: show dow at session start
+if session.isfirstbar
+    label.new(bar_index, high + syminfo.mintick * 5, "dow=" + str.tostring(nyDow) + " h=" + str.tostring(nyHour), style=label.style_label_down, size=size.tiny, color=color.aqua, textcolor=color.black)
+
+isMon = nyDow == dayofweek.monday
+isTue = nyDow == dayofweek.tuesday
+isWed = nyDow == dayofweek.wednesday
+isThu = nyDow == dayofweek.thursday
+isFri = nyDow == dayofweek.friday
+isWeekday = isMon or isTue or isWed or isThu or isFri
+
+isSessionStart = session.isfirstbar and isWeekday
+
+var int  lastMonDate  = -1
+var int  lastMonMonth = -1
+var int  wkCount      = 0
+var bool oddWeek      = false
+
+if isSessionStart and isMon
+    if nyDate != lastMonDate or nyMon != lastMonMonth
+        lastMonDate  := nyDate
+        lastMonMonth := nyMon
+        wkCount      := wkCount + 1
+        oddWeek       := wkCount % 2 == 1
+
+isA = isMon or isWed or isFri
+
+purpleC = color.new(color.purple, 30)
+yellowC = color.new(color.yellow, 30)
+orangeC = color.new(color.orange, 30)
+greenC  = color.new(color.green,  30)
+
+var color bc    = purpleC
+var float dOpen = na
+var float dHigh = na
+var float dLow  = na
+var box   dBox  = na
+var box[] boxes = array.new<box>()
+var label[] lbs = array.new<label>()
+
+if not na(dOpen)
+    dHigh := math.max(dHigh, high)
+    dLow  := math.min(dLow, low)
+    box.set_right(dBox, bar_index)
+    box.set_top(dBox, dHigh)
+    box.set_bottom(dBox, dLow)
+
+if isSessionStart
+    isOdd = weekOneIsOdd ? oddWeek : not oddWeek
+    if isOdd
+        bc := isA ? purpleC : yellowC
+    else
+        bc := isA ? orangeC : greenC
+
+    dOpen := open
+    dHigh := high
+    dLow  := low
+    dBox  := box.new(bar_index, open, bar_index, open, bgcolor=bc, border_color=color.new(color.white, 60))
+    array.push(boxes, dBox)
+
+    dn = isMon ? "Mon" : isTue ? "Tue" : isWed ? "Wed" : isThu ? "Thu" : "Fri"
+    array.push(lbs, label.new(bar_index, open, dn + " W" + str.tostring(wkCount), style=label.style_label_down, size=size.small, color=color.white, textcolor=color.black))
