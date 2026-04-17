@@ -1,0 +1,340 @@
+// @version=6
+// =============================================================================
+// previousdaybot — NQ Dual-Strategy Bot
+// =============================================================================
+// Two strategies, one script:
+//
+//   RTH_PDHL (9:30 AM – 4:00 PM NY):
+//     Watches previous day's RTH high and low.
+//     Four setups:
+//       - Rejection at PDH: price in zone + bearish wick → SHORT
+//       - Rejection at PDL: price in zone + bullish wick → LONG
+//       - Breakout above PDH: close > PDH + confirm_pts → LONG
+//       - Breakdown below PDL: close < PDL - confirm_pts → SHORT
+//
+//   OVERNIGHT (8:00 PM – 9:29 AM NY):
+//     Watches the globex open at 20:00.
+//     If price moves 10+ pts from the 20:00 open in the first 7 minutes,
+//     enters in the direction of that move.
+//
+// One trade per session per strategy. Adaptive stop/trail identical to noelnqbot.
+// Webhook alerts fire on entry and exit, JSON formatted for the Railway relay.
+// =============================================================================
+
+strategy(
+    title             = "previousdaybot v1",
+    shorttitle        = "pdb",
+    overlay           = true,
+    pyramiding        = 0,
+    default_qty_type  = strategy.fixed,
+    default_qty_value = 2,
+    initial_capital   = 50000,
+    currency          = currency.USD,
+    calc_on_every_tick = false,
+    process_orders_on_close = true,
+    commission_type   = strategy.commission.cash_per_contract,
+    commission_value  = 0.74,
+    slippage          = 1
+)
+
+// =============================================================================
+// INPUTS
+// =============================================================================
+
+contracts = input.int(2, "Contracts (MNQ)", minval=1, maxval=20)
+webhookSecret = input.string("changeme", "Webhook secret", tooltip="Must match WEBHOOK_SECRET in Railway env vars.")
+enableAlerts = input.bool(true, "Enable webhook alerts")
+
+// --- Stop / Trail ---
+initialStopPts     = input.float(15.0, "Initial stop (pts)",          minval=1.0, group="Stop/Trail")
+reduceRiskAtPts    = input.float(10.0, "Reduce risk at +X pts",       minval=1.0, group="Stop/Trail")
+reduceRiskToPts    = input.float(-8.0, "...move stop to Y from entry", group="Stop/Trail",
+    tooltip="Negative = still at a loss but reduced.")
+breakevenPlusAtPts = input.float(15.0, "Breakeven+ at +X pts",        minval=1.0, group="Stop/Trail")
+breakevenPlusToPts = input.float(5.0,  "...move stop to +Y",          group="Stop/Trail")
+trailBehindPts     = input.float(10.0, "Trail Y pts behind price",     minval=1.0, group="Stop/Trail")
+
+// --- RTH PDHL ---
+pdhl_zonePts       = input.float(5.0,  "PDHL: zone width from level (pts)",       minval=0.5, group="RTH PDHL")
+pdhl_wickPts       = input.float(3.0,  "PDHL: min wick for rejection (pts)",      minval=0.5, group="RTH PDHL")
+pdhl_breakoutPts   = input.float(2.0,  "PDHL: breakout confirm above/below (pts)", minval=0.25, group="RTH PDHL")
+pdhl_stopPts       = input.float(15.0, "PDHL: stop (pts)",                        minval=1.0, group="RTH PDHL")
+
+// --- Overnight ---
+on_minMovePts      = input.float(10.0, "Overnight: min move from 20:00 open (pts)", minval=1.0, group="Overnight")
+on_windowMinutes   = input.int(7,      "Overnight: setup window (minutes after 20:00)", minval=1, group="Overnight")
+on_stopPts         = input.float(20.0, "Overnight: stop (pts)",                    minval=1.0, group="Overnight")
+
+// =============================================================================
+// TIME
+// =============================================================================
+
+nyHour   = hour(time,   "America/New_York")
+nyMinute = minute(time, "America/New_York")
+tod      = nyHour * 60 + nyMinute  // minutes since midnight NY
+
+inRTH       = tod >= 570  and tod < 960   // 09:30 – 16:00
+inOvernight = tod >= 1200 or  tod < 570   // 20:00 – 09:29
+
+isNewDay         = ta.change(time("D")) != 0
+isGlobexOpen     = nyHour == 20 and nyMinute == 0
+minutesFromGlobex = inOvernight ? (tod >= 1200 ? tod - 1200 : tod + 240) : -1
+inGlobexWindow   = minutesFromGlobex >= 0 and minutesFromGlobex <= on_windowMinutes
+
+// =============================================================================
+// PREVIOUS DAY HIGH / LOW
+// =============================================================================
+
+var float pdHigh    = na
+var float pdLow     = na
+var float todayHigh = na
+var float todayLow  = na
+
+if isNewDay
+    pdHigh    := todayHigh
+    pdLow     := todayLow
+    todayHigh := na
+    todayLow  := na
+
+if inRTH
+    todayHigh := na(todayHigh) ? high : math.max(todayHigh, high)
+    todayLow  := na(todayLow)  ? low  : math.min(todayLow,  low)
+
+// =============================================================================
+// OVERNIGHT OPEN TRACKING
+// =============================================================================
+
+var float globexOpenPrice = na
+var float globexHigh      = na
+var float globexLow       = na
+
+if isGlobexOpen
+    globexOpenPrice := open
+    globexHigh      := high
+    globexLow       := low
+
+if inOvernight and not isGlobexOpen
+    globexHigh := na(globexHigh) ? high : math.max(globexHigh, high)
+    globexLow  := na(globexLow)  ? low  : math.min(globexLow,  low)
+
+// =============================================================================
+// SESSION TRADE GATES
+// =============================================================================
+// One trade per RTH session, one per overnight session.
+
+var bool rthTradeFired       = false
+var bool overnightTradeFired = false
+var bool rthStoppedOut       = false
+var bool overnightStoppedOut = false
+var int  lastRthDay          = -1
+var int  lastOvernightDay    = -1
+
+// Reset RTH gate at each new RTH open
+if isNewDay
+    rthTradeFired   := false
+    rthStoppedOut   := false
+    lastRthDay      := dayofmonth(time)
+
+// Reset overnight gate at globex open
+if isGlobexOpen
+    overnightTradeFired := false
+    overnightStoppedOut := false
+
+// =============================================================================
+// RTH PDHL — TRIGGER DETECTION
+// =============================================================================
+
+priceMovingUp   = close > close[1]
+priceMovingDown = close < close[1]
+
+upperWick = high  - math.max(open, close)
+lowerWick = math.min(open, close) - low
+barIsRed  = close < open
+barIsGreen = close > open
+
+pdHighValid = not na(pdHigh)
+pdLowValid  = not na(pdLow)
+
+// Near PDH zone
+nearPDH     = pdHighValid and math.abs(close - pdHigh) <= pdhl_zonePts
+// Near PDL zone
+nearPDL     = pdLowValid  and math.abs(close - pdLow)  <= pdhl_zonePts
+// Breakout above PDH
+abovePDH    = pdHighValid and close > (pdHigh + pdhl_breakoutPts)
+// Breakdown below PDL
+belowPDL    = pdLowValid  and close < (pdLow  - pdhl_breakoutPts)
+
+canTrade = inRTH and not rthTradeFired and not rthStoppedOut and strategy.position_size == 0
+
+// SHORT: rejection at PDH (bearish wick at resistance)
+pdh_Short = canTrade and nearPDH and upperWick >= pdhl_wickPts and barIsRed
+// LONG:  rejection at PDL (bullish wick at support)
+pdl_Long  = canTrade and nearPDL and lowerWick >= pdhl_wickPts and barIsGreen
+// LONG:  breakout above PDH
+pdh_BreakoutLong  = canTrade and abovePDH and priceMovingUp
+// SHORT: breakdown below PDL
+pdl_BreakdownShort = canTrade and belowPDL and priceMovingDown
+
+// =============================================================================
+// OVERNIGHT — TRIGGER DETECTION
+// =============================================================================
+
+overnightMoveUp   = not na(globexOpenPrice) and (close - globexOpenPrice) >= on_minMovePts
+overnightMoveDown = not na(globexOpenPrice) and (globexOpenPrice - close) >= on_minMovePts
+
+canTradeOvernight = inGlobexWindow and not overnightTradeFired and not overnightStoppedOut and strategy.position_size == 0
+
+overnight_Long  = canTradeOvernight and overnightMoveUp   and priceMovingUp
+overnight_Short = canTradeOvernight and overnightMoveDown and priceMovingDown
+
+// =============================================================================
+// ENTRIES
+// =============================================================================
+
+var string activeStrategy = ""
+var string activeSetup    = ""
+
+if pdh_Short
+    strategy.entry("PDH_Short", strategy.short, qty=contracts, comment="PDH_Short")
+    rthTradeFired  := true
+    activeStrategy := "RTH_PDHL"
+    activeSetup    := "PDH_rejection"
+
+if pdl_Long
+    strategy.entry("PDL_Long", strategy.long, qty=contracts, comment="PDL_Long")
+    rthTradeFired  := true
+    activeStrategy := "RTH_PDHL"
+    activeSetup    := "PDL_rejection"
+
+if pdh_BreakoutLong
+    strategy.entry("PDH_BreakLong", strategy.long, qty=contracts, comment="PDH_BreakLong")
+    rthTradeFired  := true
+    activeStrategy := "RTH_PDHL"
+    activeSetup    := "PDH_breakout"
+
+if pdl_BreakdownShort
+    strategy.entry("PDL_BreakShort", strategy.short, qty=contracts, comment="PDL_BreakShort")
+    rthTradeFired  := true
+    activeStrategy := "RTH_PDHL"
+    activeSetup    := "PDL_breakdown"
+
+if overnight_Long
+    strategy.entry("ON_Long", strategy.long, qty=contracts, comment="ON_Long")
+    overnightTradeFired := true
+    activeStrategy      := "OVERNIGHT"
+    activeSetup         := "globex_long"
+
+if overnight_Short
+    strategy.entry("ON_Short", strategy.short, qty=contracts, comment="ON_Short")
+    overnightTradeFired := true
+    activeStrategy      := "OVERNIGHT"
+    activeSetup         := "globex_short"
+
+// =============================================================================
+// STOP / TRAIL MANAGEMENT
+// =============================================================================
+
+var float currentStop    = na
+var float entryPriceVar  = na
+
+// Set initial stop on new entry
+if strategy.position_size != 0 and strategy.position_size[1] == 0
+    entryPriceVar := strategy.position_avg_price
+    isLongEntry   = strategy.position_size > 0
+    stopPts       = (activeStrategy == "OVERNIGHT") ? on_stopPts : pdhl_stopPts
+    currentStop   := isLongEntry ? (entryPriceVar - stopPts) : (entryPriceVar + stopPts)
+
+// Adaptive trail each bar
+if strategy.position_size != 0
+    isLong        = strategy.position_size > 0
+    unrealizedPts = isLong ? (close - entryPriceVar) : (entryPriceVar - close)
+    proposed      = currentStop
+
+    if unrealizedPts >= breakevenPlusAtPts
+        trailStop  = isLong ? (close - trailBehindPts) : (close + trailBehindPts)
+        bePlusStop = isLong ? (entryPriceVar + breakevenPlusToPts) : (entryPriceVar - breakevenPlusToPts)
+        candidate  = isLong ? math.max(trailStop, bePlusStop) : math.min(trailStop, bePlusStop)
+        proposed  := isLong ? math.max(currentStop, candidate) : math.min(currentStop, candidate)
+    else if unrealizedPts >= reduceRiskAtPts
+        reducedStop = isLong ? (entryPriceVar + reduceRiskToPts) : (entryPriceVar - reduceRiskToPts)
+        proposed   := isLong ? math.max(currentStop, reducedStop) : math.min(currentStop, reducedStop)
+
+    currentStop := proposed
+
+    // Submit stops for all possible entry IDs
+    strategy.exit("Stop_PDH_S",  from_entry="PDH_Short",     stop=currentStop)
+    strategy.exit("Stop_PDL_L",  from_entry="PDL_Long",      stop=currentStop)
+    strategy.exit("Stop_PDH_BL", from_entry="PDH_BreakLong", stop=currentStop)
+    strategy.exit("Stop_PDL_BS", from_entry="PDL_BreakShort", stop=currentStop)
+    strategy.exit("Stop_ON_L",   from_entry="ON_Long",       stop=currentStop)
+    strategy.exit("Stop_ON_S",   from_entry="ON_Short",      stop=currentStop)
+
+// Mark session done when position closes
+if strategy.position_size == 0 and strategy.position_size[1] != 0
+    if activeStrategy == "OVERNIGHT"
+        overnightStoppedOut := true
+    else
+        rthStoppedOut := true
+    currentStop   := na
+    entryPriceVar := na
+
+// =============================================================================
+// VISUALS
+// =============================================================================
+
+plot(pdHighValid ? pdHigh : na, "Prev Day High", color=color.new(color.red,    40), linewidth=1, style=plot.style_line)
+plot(pdLowValid  ? pdLow  : na, "Prev Day Low",  color=color.new(color.green,  40), linewidth=1, style=plot.style_line)
+plot(not na(globexOpenPrice) and inOvernight ? globexOpenPrice : na, "Globex Open",
+    color=color.new(color.orange, 40), linewidth=1)
+plot(strategy.position_size != 0 ? currentStop : na, "Stop",
+    color=color.new(color.red, 0), linewidth=2, style=plot.style_linebr)
+
+bgcolor(inRTH       ? color.new(color.blue,   95) : na, title="RTH")
+bgcolor(inOvernight ? color.new(color.purple, 95) : na, title="Overnight")
+
+// =============================================================================
+// WEBHOOK ALERTS
+// =============================================================================
+
+onEntry = pdh_Short or pdl_Long or pdh_BreakoutLong or pdl_BreakdownShort or overnight_Long or overnight_Short
+onExit  = strategy.position_size == 0 and strategy.position_size[1] != 0
+
+if enableAlerts and onEntry
+    isLongEntry = pdl_Long or pdh_BreakoutLong or overnight_Long
+    action      = isLongEntry ? "long_entry" : "short_entry"
+    stopPtsUsed = activeStrategy == "OVERNIGHT" ? on_stopPts : pdhl_stopPts
+
+    jsonMsg = '{"secret":"' + webhookSecret + '"'
+        + ',"strategy":"' + activeStrategy + '"'
+        + ',"action":"' + action + '"'
+        + ',"price":' + str.tostring(close, "#.##")
+        + ',"ticker":"' + syminfo.ticker + '"'
+        + ',"contracts":' + str.tostring(contracts)
+        + ',"stop_pts":' + str.tostring(stopPtsUsed, "#.#")
+        + ',"setup":"' + activeSetup + '"'
+        + ',"pd_high":' + str.tostring(pdHigh, "#.##")
+        + ',"pd_low":' + str.tostring(pdLow, "#.##")
+        + '}'
+
+    alert(jsonMsg, alert.freq_once_per_bar_close)
+
+if enableAlerts and onExit
+    isLongExit  = strategy.position_size[1] > 0
+    action      = isLongExit ? "long_exit" : "short_exit"
+    grossProfit = strategy.closedtrades.profit(strategy.closedtrades - 1)
+        + strategy.closedtrades.commission(strategy.closedtrades - 1)
+    pnlPts      = grossProfit / (syminfo.pointvalue * contracts)
+    pnlDollars  = strategy.closedtrades.profit(strategy.closedtrades - 1)
+
+    jsonMsg = '{"secret":"' + webhookSecret + '"'
+        + ',"strategy":"' + activeStrategy + '"'
+        + ',"action":"' + action + '"'
+        + ',"price":' + str.tostring(close, "#.##")
+        + ',"ticker":"' + syminfo.ticker + '"'
+        + ',"contracts":' + str.tostring(contracts)
+        + ',"stop_pts":0'
+        + ',"pnl_pts":' + str.tostring(pnlPts, "#.##")
+        + ',"pnl_usd":' + str.tostring(pnlDollars, "#.##")
+        + '}'
+
+    alert(jsonMsg, alert.freq_once_per_bar_close)
