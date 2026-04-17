@@ -41,7 +41,7 @@ strategy(
 // INPUTS
 // =============================================================================
 
-contracts = input.int(2, "Contracts (MNQ)", minval=1, maxval=20)
+contracts = input.int(5, "Contracts (MNQ)", minval=1, maxval=20)
 webhookSecret = input.string("changeme", "Webhook secret", tooltip="Must match WEBHOOK_SECRET in Railway env vars.")
 enableAlerts = input.bool(true, "Enable webhook alerts")
 
