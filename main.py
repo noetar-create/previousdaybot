@@ -1,9 +1,10 @@
 """FastAPI service. Receives Pine alerts, persists state, emits Telegram cards."""
 from __future__ import annotations
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
-from datetime import date, datetime
+from datetime import date, datetime, timezone, timedelta
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, status
 
@@ -22,11 +23,35 @@ logging.basicConfig(
 log = logging.getLogger("nq-dual-bot")
 
 
+async def _eod_scheduler():
+    """Fires daily summary at 4:15pm ET every trading day."""
+    last_fired = None
+    while True:
+        await asyncio.sleep(30)
+        ny = timezone(timedelta(hours=-4))
+        now = datetime.now(ny)
+        today = now.date()
+        target = now.replace(hour=16, minute=15, second=0, microsecond=0)
+        if now >= target and last_fired != today:
+            last_fired = today
+            try:
+                stats = await tracker.daily_pnl()
+                await telegram.send_daily_summary(
+                    stats["date"], stats["pnl_usd"], stats["entries"],
+                    stats["wins"], stats["losses"],
+                )
+                log.info(f"EOD summary sent for {today}")
+            except Exception as exc:
+                log.error(f"EOD summary error: {exc}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await store.init_db()
-    log.info("service_started", extra={"dry_run": settings().dry_run_notify_only})
+    task = asyncio.create_task(_eod_scheduler())
+    log.info("service_started eod_scheduler=active", extra={"dry_run": settings().dry_run_notify_only})
     yield
+    task.cancel()
     log.info("service_stopped")
 
 
